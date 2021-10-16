@@ -775,6 +775,10 @@ static ssize_t writeback_store(struct device *dev,
 		zram_set_element(zram, index, blk_idx);
 		blk_idx = 0;
 		atomic64_inc(&zram->stats.pages_stored);
+#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+		atomic64_inc(&zram->stats.bd_objcnt);
+		count_vm_event(SQZR_OBJCNT);
+#endif
 		spin_lock(&zram->wb_limit_lock);
 		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
 			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
