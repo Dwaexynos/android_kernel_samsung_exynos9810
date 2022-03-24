@@ -625,6 +625,472 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 	return 1;
 }
 
+#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+static int zram_balance_ratio = 25;	/* nand writeback ratio */
+module_param(zram_balance_ratio, int, 0644);
+
+static bool is_bdev_avail(struct zram *zram)
+{
+	struct loop_device *lo;
+	struct inode *inode;
+	struct dentry *root;
+	struct kstatfs statbuf;
+	u64 min_free_blocks;
+	int ret;
+
+	if (!zram->bdev->bd_disk)
+		return false;
+
+	lo = zram->bdev->bd_disk->private_data;
+	if (!lo || !lo->lo_backing_file)
+		return false;
+
+	inode = lo->lo_backing_file->f_mapping->host;
+	root = inode->i_sb->s_root;
+	if (!root->d_sb->s_op->statfs)
+		return false;
+
+	ret = root->d_sb->s_op->statfs(root, &statbuf);
+	if (ret)
+		return false;
+	/*
+	 * To guarantee "reserved block(133MB on Q-os)" for system,
+	 * SQZR is triggered only when devices have enough storage free space
+	 * more than SZ_1G or reserved block * 2.
+	 */
+	min_free_blocks = max_t(u64, SZ_1G / statbuf.f_bsize,
+			(statbuf.f_bfree - statbuf.f_bavail) * 2);
+	if (statbuf.f_bavail < min_free_blocks)
+		return false;
+
+	return true;
+}
+
+static inline bool zram_throttle_writeback_size(struct zram *zram)
+{
+	long objcnt = atomic64_read(&zram->stats.bd_objcnt);
+
+	if ((unsigned long)objcnt >= zram->nr_pages * 4)
+		return true;
+	else
+		return false;
+}
+
+static bool zram_wb_available(struct zram *zram)
+{
+	if (!zram->wb_table)
+		return false;
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable && !zram->bd_wb_limit) {
+		spin_unlock(&zram->wb_limit_lock);
+		return false;
+	}
+	spin_unlock(&zram->wb_limit_lock);
+
+	if (zram_throttle_writeback_size(zram))
+		return false;
+	return true;
+}
+
+static u32 entry_to_index(struct zram *zram, struct zram_table_entry *entry)
+{
+	return (u32)(((unsigned long)entry - (unsigned long)zram->table) /
+			sizeof(struct zram_table_entry));
+}
+
+#define SKIP 1
+#define ABORT 2
+static int zram_try_mark_page(struct zram *zram, u32 index)
+{
+	if (!zram_slot_trylock(zram, index))
+		return SKIP;
+
+	if (!zram_allocated(zram, index)) {
+		zram_slot_unlock(zram, index);
+		return ABORT;
+	}
+	if (zram_test_flag(zram, index, ZRAM_SAME) ||
+			zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+		zram_slot_unlock(zram, index);
+		return SKIP;
+	}
+	zram_set_flag(zram, index, ZRAM_IDLE);
+	zram_slot_unlock(zram, index);
+	return 0;
+}
+
+#define ZRAM_WBD_INTERVAL 10 * HZ
+static bool zram_should_writeback(struct zram *zram,
+				unsigned long pages, bool trigger)
+{
+	unsigned long stored = atomic64_read(&zram->stats.pages_stored);
+	unsigned long writtenback = atomic64_read(&zram->stats.bd_objcnt) -
+				    atomic64_read(&zram->stats.bd_expire);
+	unsigned long min_stored_byte;
+	int writtenback_ratio = stored ? (writtenback * 100) / stored : 0;
+	int min_writtenback_ratio = zram_balance_ratio;
+	int margin = max_t(int, 1, zram_balance_ratio / 10);
+	int max_pages = CONFIG_ZRAM_LRU_WRITEBACK_LIMIT;
+	static unsigned long time_stamp;
+	bool ret = true;
+
+	/* avoid app launch time */
+	if (is_app_launch)
+		return false;
+
+	/* stop thread when writtenback enough */
+	if (pages > max_pages)
+		return false;
+
+	/* do not trigger again before time interval */
+	if (trigger && time_is_after_jiffies(time_stamp))
+		return false;
+
+	if (trigger)
+		min_writtenback_ratio -= margin;
+	else
+		min_writtenback_ratio += margin;
+	if (min_writtenback_ratio < writtenback_ratio)
+		ret = false;
+
+	if (zram->disksize < SZ_4G)
+		min_stored_byte = SZ_512M;
+	else
+		min_stored_byte = SZ_1G;
+	if ((stored << PAGE_SHIFT) < min_stored_byte)
+		ret = false;
+
+	if (trigger && ret == true)
+		time_stamp = jiffies + ZRAM_WBD_INTERVAL;
+
+	return ret;
+}
+
+static void try_wakeup_zram_wbd(struct zram *zram)
+{
+	if (zram->backing_dev && !zram->wbd_running &&
+			zram_wb_available(zram) &&
+			zram_should_writeback(zram, 0, true) &&
+			is_bdev_avail(zram)) {
+		zram->wbd_running = true;
+		wake_up(&zram->wbd_wait);
+	}
+}
+
+static int zram_app_launch_notifier(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	is_app_launch = action ? true : false;
+
+	if (!is_app_launch && g_zram)
+		try_wakeup_zram_wbd(g_zram);
+
+	return 0;
+}
+
+static struct notifier_block zram_app_launch_nb = {
+	.notifier_call = zram_app_launch_notifier,
+};
+
+static void mark_end_of_page(struct page *page, int offset)
+{
+	struct zram_wb_header *zhdr;
+	void *mem;
+
+	if (offset + sizeof(struct zram_wb_header) < PAGE_SIZE) {
+		mem = kmap_atomic(page);
+		zhdr = (struct zram_wb_header *)(mem + offset);
+		zhdr->index = UINT_MAX;
+		zhdr->size = 0;
+		kunmap_atomic(mem);
+	}
+}
+
+static int zram_writeback_fill_page(struct zram *zram, u32 index,
+				struct page *page, int offset)
+{
+	struct zram_wb_header *zhdr;
+	unsigned long handle;
+	void *src, *dst;
+	int ret, size;
+	int header_sz = 0;
+
+	zram_slot_lock(zram, index);
+	if (!zram_allocated(zram, index) ||
+			!zram_test_flag(zram, index, ZRAM_IDLE) ||
+			zram_test_flag(zram, index, ZRAM_WB) ||
+			zram_test_flag(zram, index, ZRAM_SAME) ||
+			zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+		zram_slot_unlock(zram, index);
+		return 0;
+	}
+	size = zram_get_obj_size(zram, index);
+	if (size != PAGE_SIZE)
+		header_sz = sizeof(struct zram_wb_header);
+
+	if (offset + header_sz + size > PAGE_SIZE) {
+		zram_slot_unlock(zram, index);
+		return -ENOSPC;
+	}
+	/*
+	 * Clearing ZRAM_UNDER_WB is duty of caller.
+	 * IOW, zram_free_page never clear it.
+	 */
+	zram_set_flag(zram, index, ZRAM_UNDER_WB);
+	/* Need for hugepage writeback racing */
+	zram_set_flag(zram, index, ZRAM_IDLE);
+
+	handle = zram_get_element(zram, index);
+	if (!handle) {
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_slot_unlock(zram, index);
+		return -ENOENT;
+	}
+	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
+	dst = kmap_atomic(page);
+	if (size != PAGE_SIZE) {
+		zhdr = (struct zram_wb_header *)(dst + offset);
+		zhdr->index = index;
+		zhdr->size = size;
+		dst = (u8 *)(zhdr + 1);
+	}
+	memcpy(dst, src, size);
+	ret = size;
+	kunmap_atomic(dst);
+	zs_unmap_object(zram->mem_pool, handle);
+	zram_slot_unlock(zram, index);
+
+	return ret;
+}
+
+static void zram_writeback_clear_flag(struct zram *zram,
+			struct zram_wb_entry *entry, unsigned int count)
+{
+	unsigned long index;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		index = entry[i].index;
+		zram_slot_lock(zram, index);
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_slot_unlock(zram, index);
+	}
+}
+
+static void zram_writeback_done(struct zram *zram, unsigned long blk_idx,
+			struct zram_wb_entry *entry, unsigned int count)
+{
+	unsigned long index;
+	unsigned int offset;
+	unsigned int size;
+	int i;
+	unsigned long flags;
+
+	spin_lock_irqsave(&zram->wb_table_lock, flags);
+	zram->wb_table[blk_idx] = count;
+	spin_unlock_irqrestore(&zram->wb_table_lock, flags);
+	atomic64_add(count, &zram->stats.bd_objcnt);
+	count_vm_events(SQZR_OBJCNT, count);
+
+	for (i = 0; i < count; i++) {
+		index = entry[i].index;
+		offset = entry[i].offset;
+		size = entry[i].size;
+		/*
+		 * We released zram_slot_lock so need to check if the slot was
+		 * changed. If there is freeing for the slot, we can catch it
+		 * easily by zram_allocated.
+		 * A subtle case is the slot is freed/reallocated/marked as
+		 * ZRAM_IDLE again. To close the race, idle_store doesn't
+		 * mark ZRAM_IDLE once it found the slot was ZRAM_UNDER_WB.
+		 * Thus, we could close the race by checking ZRAM_IDLE bit.
+		 */
+		zram_slot_lock(zram, index);
+		if (!zram_allocated(zram, index) ||
+				!zram_test_flag(zram, index, ZRAM_IDLE)) {
+			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+			zram_clear_flag(zram, index, ZRAM_IDLE);
+			free_block_bdev(zram, blk_idx);
+			zram_slot_unlock(zram, index);
+			continue;;
+		}
+
+		zram_free_page(zram, index);
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_set_flag(zram, index, ZRAM_WB);
+		/* record element as "blk_idx|offset|size" */
+		if (size == PAGE_SIZE)
+			size = 0;
+		zram_set_element(zram, index,
+				(blk_idx << (PAGE_SHIFT * 2)) | (offset << PAGE_SHIFT) | size);
+		zram_slot_unlock(zram, index);
+		atomic64_inc(&zram->stats.pages_stored);
+	}
+}
+
+static void zram_writeback_end_io(struct bio *bio)
+{
+	struct page *page = bio->bi_io_vec[0].bv_page;
+	struct zram *zram = (struct zram *)page_private(page);
+
+	zram->io_complete = true;
+	wake_up(&zram->wbd_wait);
+}
+
+static int zram_writeback_page(struct zram *zram, struct page *page,
+			struct zram_wb_entry *entry, int count, bool sync)
+{
+	struct bio bio;
+	struct bio_vec bio_vec;
+	unsigned long blk_idx;
+	int ret = 0;
+
+	blk_idx = alloc_block_bdev(zram);
+	if (!blk_idx) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	bio_init(&bio, &bio_vec, 1);
+	bio.bi_bdev = zram->bdev;
+	bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	bio.bi_opf = REQ_OP_WRITE;
+	bio_add_page(&bio, page, PAGE_SIZE, 0);
+	if (sync) {
+		ret = submit_bio_wait(&bio);
+	} else {
+		bio.bi_end_io = zram_writeback_end_io;
+		zram->io_complete = false;
+		submit_bio(&bio);
+		wait_event(zram->wbd_wait, zram->io_complete);
+		ret = bio.bi_error;
+	}
+	if (ret) {
+		ret = -EIO;
+		free_block_bdev(zram, blk_idx);
+		pr_err("%s failed %lu", __func__, blk_idx);
+		goto out;
+	}
+	atomic64_inc(&zram->stats.bd_writes);
+#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+	count_vm_event(SQZR_WRITE);
+#endif
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
+		zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
+	spin_unlock(&zram->wb_limit_lock);
+out:
+	if (ret)
+		zram_writeback_clear_flag(zram, entry, count);
+	else
+		zram_writeback_done(zram, blk_idx, entry, count);
+	return ret;
+}
+
+#define ZRAM_WB_THRESHOLD 32
+static int zram_comp_writeback_index(struct zram *zram, u32 index,
+			struct zram_wb_entry *entry, int *count,
+			struct page *page, int *offset, bool sync)
+{
+	int size, ret = 0;
+	int cnt = *count;
+	int off = *offset;
+retry:
+	size = zram_writeback_fill_page(zram, index, page, off);
+	if (size > 0) {
+		entry[cnt].index = index;
+		entry[cnt].offset = off;
+		entry[cnt].size = size;
+		off += size;
+		if (size < PAGE_SIZE)
+			off += sizeof(struct zram_wb_header);
+		cnt++;
+	}
+	/* writeback if page is full/entry is full */
+	if (size == -ENOSPC || off == PAGE_SIZE || cnt == ZRAM_WB_THRESHOLD) {
+		mark_end_of_page(page, off);
+		ret = zram_writeback_page(zram, page, entry, cnt, sync);
+		cnt = off = 0;
+		if (ret)
+			goto out;
+		if (size == -ENOSPC)
+			goto retry;
+	}
+out:
+	*count = cnt;
+	*offset = off;
+	return ret;
+}
+
+static void zram_comp_writeback(struct zram *zram, struct page *page)
+{
+	struct zram_wb_entry entry[ZRAM_WB_THRESHOLD];
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long index;
+	u32 offset = 0;
+	int count = 0;
+
+	set_page_private(page, (unsigned long)zram);
+
+	for (index = 0; index < nr_pages; index++) {
+		if (!zram_wb_available(zram))
+			break;
+		if (zram_comp_writeback_index(zram, index,
+				entry, &count, page, &offset, true))
+			break;
+	}
+	pr_info("%s done", __func__);
+}
+
+static int zram_wbd(void *p)
+{
+	struct zram_wb_entry entry[ZRAM_WB_THRESHOLD];
+	struct zram *zram = (struct zram *)p;
+	struct zram_table_entry *zram_entry, *n;
+	struct page *page;
+	u32 index, offset = 0;
+	int count = 0;
+	int ret;
+
+	set_freezable();
+
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return 0;
+	set_page_private(page, (unsigned long)zram);
+
+	while (!kthread_should_stop()) {
+		unsigned long nr_pages = 0;
+		wait_event_freezable(zram->wbd_wait,
+				zram->wbd_running || kthread_should_stop());
+		list_for_each_entry_safe(zram_entry, n, &zram->list, lru_list) {
+			if (try_to_freeze() || kthread_should_stop())
+				break;
+			if (!zram_wb_available(zram))
+				break;
+			index = entry_to_index(zram, zram_entry);
+			ret = zram_try_mark_page(zram, index);
+			if (ret == SKIP)
+				continue;
+			else if (ret == ABORT)
+				break;
+			if (zram_comp_writeback_index(zram, index,
+					entry, &count, page, &offset, false))
+				break;
+			if (!zram_should_writeback(zram, ++nr_pages, false))
+				break;
+		}
+		zram->wbd_running = false;
+		pr_info("%s done", __func__);
+	}
+	__free_page(page);
+
+	return 0;
+}
+#endif
+
 #define HUGE_WRITEBACK 1
 #define IDLE_WRITEBACK 2
 
