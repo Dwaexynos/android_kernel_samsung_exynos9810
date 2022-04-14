@@ -451,9 +451,4 @@ static inline int kvm_arm_have_ssbd(void)
 		return KVM_SSBD_UNKNOWN;
 	}
 }
-
-static inline bool kvm_arm_spectre_bhb_mitigated(void)
-{
-	return arm64_get_spectre_bhb_state() == SPECTRE_MITIGATED;
-}
 #endif /* __ARM64_KVM_HOST_H__ */
