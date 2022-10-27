@@ -2184,8 +2184,7 @@ static void btrfs_init_balance(struct btrfs_fs_info *fs_info)
 	init_waitqueue_head(&fs_info->balance_wait_q);
 }
 
-static void btrfs_init_btree_inode(struct btrfs_fs_info *fs_info,
-				   struct btrfs_root *tree_root)
+static void btrfs_init_btree_inode(struct btrfs_fs_info *fs_info)
 {
 	fs_info->btree_inode->i_ino = BTRFS_BTREE_INODE_OBJECTID;
 	set_nlink(fs_info->btree_inode, 1);
@@ -2205,7 +2204,7 @@ static void btrfs_init_btree_inode(struct btrfs_fs_info *fs_info,
 
 	BTRFS_I(fs_info->btree_inode)->io_tree.ops = &btree_extent_io_ops;
 
-	BTRFS_I(fs_info->btree_inode)->root = tree_root;
+	BTRFS_I(fs_info->btree_inode)->root = fs_info->tree_root;
 	memset(&BTRFS_I(fs_info->btree_inode)->location, 0,
 	       sizeof(struct btrfs_key));
 	set_bit(BTRFS_INODE_DUMMY,
@@ -2372,8 +2371,8 @@ static int btrfs_replay_log(struct btrfs_fs_info *fs_info,
 		return ret;
 	}
 
-	if (fs_info->sb->s_flags & MS_RDONLY) {
-		ret = btrfs_commit_super(tree_root);
+	if (sb_rdonly(fs_info->sb)) {
+		ret = btrfs_commit_super(fs_info);
 		if (ret)
 			return ret;
 	}
@@ -2381,12 +2380,14 @@ static int btrfs_replay_log(struct btrfs_fs_info *fs_info,
 	return 0;
 }
 
-static int btrfs_read_roots(struct btrfs_fs_info *fs_info,
-			    struct btrfs_root *tree_root)
+static int btrfs_read_roots(struct btrfs_fs_info *fs_info)
 {
+	struct btrfs_root *tree_root = fs_info->tree_root;
 	struct btrfs_root *root;
 	struct btrfs_key location;
 	int ret;
+
+	BUG_ON(!fs_info->tree_root);
 
 	location.objectid = BTRFS_EXTENT_TREE_OBJECTID;
 	location.type = BTRFS_ROOT_ITEM_KEY;
@@ -2597,7 +2598,7 @@ int open_ctree(struct super_block *sb,
 	sb->s_blocksize_bits = blksize_bits(4096);
 	sb->s_bdi = &fs_info->bdi;
 
-	btrfs_init_btree_inode(fs_info, tree_root);
+	btrfs_init_btree_inode(fs_info);
 
 	spin_lock_init(&fs_info->block_group_cache_lock);
 	fs_info->block_group_cache_tree = RB_ROOT;
@@ -2769,7 +2770,7 @@ int open_ctree(struct super_block *sb,
 
 	features = btrfs_super_compat_ro_flags(disk_super) &
 		~BTRFS_FEATURE_COMPAT_RO_SUPP;
-	if (!(sb->s_flags & MS_RDONLY) && features) {
+	if (!sb_rdonly(sb) && features) {
 		btrfs_err(fs_info,
 	"cannot mount read-write because of unsupported optional features (0x%llx)",
 		       features);
@@ -2811,7 +2812,7 @@ int open_ctree(struct super_block *sb,
 	sb->s_blocksize_bits = blksize_bits(sectorsize);
 
 	mutex_lock(&fs_info->chunk_mutex);
-	ret = btrfs_read_sys_array(tree_root);
+	ret = btrfs_read_sys_array(fs_info);
 	mutex_unlock(&fs_info->chunk_mutex);
 	if (ret) {
 		btrfs_err(fs_info, "failed to read the system array: %d", ret);
@@ -2840,7 +2841,7 @@ int open_ctree(struct super_block *sb,
 	read_extent_buffer(chunk_root->node, fs_info->chunk_tree_uuid,
 	   btrfs_header_chunk_tree_uuid(chunk_root->node), BTRFS_UUID_SIZE);
 
-	ret = btrfs_read_chunk_tree(chunk_root);
+	ret = btrfs_read_chunk_tree(fs_info);
 	if (ret) {
 		btrfs_err(fs_info, "failed to read chunk tree: %d", ret);
 		goto fail_tree_roots;
@@ -2888,7 +2889,7 @@ retry_root_backup:
 
 	mutex_unlock(&tree_root->objectid_mutex);
 
-	ret = btrfs_read_roots(fs_info, tree_root);
+	ret = btrfs_read_roots(fs_info);
 	if (ret)
 		goto recovery_tree_root;
 
@@ -2941,7 +2942,7 @@ retry_root_backup:
 		goto fail_sysfs;
 	}
 
-	ret = btrfs_read_block_groups(fs_info->extent_root);
+	ret = btrfs_read_block_groups(fs_info);
 	if (ret) {
 		btrfs_err(fs_info, "failed to read block groups: %d", ret);
 		goto fail_sysfs;
@@ -2950,7 +2951,7 @@ retry_root_backup:
 		btrfs_calc_num_tolerated_disk_barrier_failures(fs_info);
 	if (fs_info->fs_devices->missing_devices >
 	     fs_info->num_tolerated_disk_barrier_failures &&
-	    !(sb->s_flags & MS_RDONLY)) {
+	    !sb_rdonly(sb)) {
 		btrfs_warn(fs_info,
 "missing devices (%llu) exceeds the limit (%d), writeable mount is not allowed",
 			fs_info->fs_devices->missing_devices,
@@ -3010,11 +3011,11 @@ retry_root_backup:
 		}
 	}
 
-	ret = btrfs_find_orphan_roots(tree_root);
+	ret = btrfs_find_orphan_roots(fs_info);
 	if (ret)
 		goto fail_qgroup;
 
-	if (!(sb->s_flags & MS_RDONLY)) {
+	if (!sb_rdonly(sb)) {
 		ret = btrfs_cleanup_fs_roots(fs_info);
 		if (ret)
 			goto fail_qgroup;
@@ -3040,7 +3041,7 @@ retry_root_backup:
 		goto fail_qgroup;
 	}
 
-	if (sb->s_flags & MS_RDONLY)
+	if (sb_rdonly(sb))
 		return 0;
 
 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
@@ -3058,7 +3059,7 @@ retry_root_backup:
 		if (ret) {
 			btrfs_warn(fs_info,
 				   "failed to clear free space tree: %d", ret);
-			close_ctree(tree_root);
+			close_ctree(fs_info);
 			return ret;
 		}
 	}
@@ -3070,7 +3071,7 @@ retry_root_backup:
 		if (ret) {
 			btrfs_warn(fs_info,
 				"failed to create free space tree: %d", ret);
-			close_ctree(tree_root);
+			close_ctree(fs_info);
 			return ret;
 		}
 	}
@@ -3079,7 +3080,7 @@ retry_root_backup:
 	if ((ret = btrfs_orphan_cleanup(fs_info->fs_root)) ||
 	    (ret = btrfs_orphan_cleanup(fs_info->tree_root))) {
 		up_read(&fs_info->cleanup_work_sem);
-		close_ctree(tree_root);
+		close_ctree(fs_info);
 		return ret;
 	}
 	up_read(&fs_info->cleanup_work_sem);
@@ -3087,14 +3088,14 @@ retry_root_backup:
 	ret = btrfs_resume_balance_async(fs_info);
 	if (ret) {
 		btrfs_warn(fs_info, "failed to resume balance: %d", ret);
-		close_ctree(tree_root);
+		close_ctree(fs_info);
 		return ret;
 	}
 
 	ret = btrfs_resume_dev_replace_async(fs_info);
 	if (ret) {
 		btrfs_warn(fs_info, "failed to resume device replace: %d", ret);
-		close_ctree(tree_root);
+		close_ctree(fs_info);
 		return ret;
 	}
 
@@ -3106,7 +3107,7 @@ retry_root_backup:
 		if (ret) {
 			btrfs_warn(fs_info,
 				"failed to create the UUID tree: %d", ret);
-			close_ctree(tree_root);
+			close_ctree(fs_info);
 			return ret;
 		}
 	} else if (btrfs_test_opt(tree_root->fs_info, RESCAN_UUID_TREE) ||
@@ -3117,7 +3118,7 @@ retry_root_backup:
 		if (ret) {
 			btrfs_warn(fs_info,
 				"failed to check the UUID tree: %d", ret);
-			close_ctree(tree_root);
+			close_ctree(fs_info);
 			return ret;
 		}
 	} else {
@@ -3790,8 +3791,9 @@ int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info)
 	return err;
 }
 
-int btrfs_commit_super(struct btrfs_root *root)
+int btrfs_commit_super(struct btrfs_fs_info *fs_info)
 {
+	struct btrfs_root *root = fs_info->tree_root;
 	struct btrfs_trans_handle *trans;
 
 	mutex_lock(&root->fs_info->cleaner_mutex);
@@ -3809,9 +3811,9 @@ int btrfs_commit_super(struct btrfs_root *root)
 	return btrfs_commit_transaction(trans, root);
 }
 
-void close_ctree(struct btrfs_root *root)
+void close_ctree(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_root *root = fs_info->tree_root;
 	int ret;
 
 	set_bit(BTRFS_FS_CLOSING_START, &fs_info->flags);
@@ -3840,7 +3842,7 @@ void close_ctree(struct btrfs_root *root)
 
 	cancel_work_sync(&fs_info->async_reclaim_work);
 
-	if (!(fs_info->sb->s_flags & MS_RDONLY)) {
+	if (!sb_rdonly(fs_info->sb)) {
 		/*
 		 * If the cleaner thread is stopped and there are
 		 * block groups queued for removal, the deletion will be
@@ -3861,7 +3863,7 @@ void close_ctree(struct btrfs_root *root)
 		 */
 		btrfs_flush_workqueue(fs_info->delayed_workers);
 
-		ret = btrfs_commit_super(root);
+		ret = btrfs_commit_super(fs_info);
 		if (ret)
 			btrfs_err(fs_info, "commit super ret %d", ret);
 	}

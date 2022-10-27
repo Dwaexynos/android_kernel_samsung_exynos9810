@@ -1219,10 +1219,9 @@ void btrfs_add_dead_root(struct btrfs_root *root)
  * update all the cowonly tree roots on disk
  */
 static noinline int commit_fs_roots(struct btrfs_trans_handle *trans,
-				    struct btrfs_root *root)
+				    struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_root *gang[8];
-	struct btrfs_fs_info *fs_info = root->fs_info;
 	int i;
 	int ret;
 	int err = 0;
@@ -1236,7 +1235,7 @@ static noinline int commit_fs_roots(struct btrfs_trans_handle *trans,
 		if (ret == 0)
 			break;
 		for (i = 0; i < ret; i++) {
-			root = gang[i];
+			struct btrfs_root *root = gang[i];
 			radix_tree_tag_clear(&fs_info->fs_roots_radix,
 					(unsigned long)root->root_key.objectid,
 					BTRFS_ROOT_TRANS_TAG);
@@ -1345,7 +1344,7 @@ static int qgroup_account_snapshot(struct btrfs_trans_handle *trans,
 	 */
 	mutex_lock(&fs_info->tree_log_mutex);
 
-	ret = commit_fs_roots(trans, src);
+	ret = commit_fs_roots(trans, fs_info);
 	if (ret)
 		goto out;
 	ret = btrfs_qgroup_prepare_account_extents(trans, fs_info);
@@ -1574,7 +1573,7 @@ static noinline int create_pending_snapshot(struct btrfs_trans_handle *trans,
 	/*
 	 * insert root back/forward references
 	 */
-	ret = btrfs_add_root_ref(trans, tree_root, objectid,
+	ret = btrfs_add_root_ref(trans, fs_info, objectid,
 				 parent_root->root_key.objectid,
 				 btrfs_ino(parent_inode), index,
 				 dentry->d_name.name, dentry->d_name.len);
@@ -1634,14 +1633,14 @@ static noinline int create_pending_snapshot(struct btrfs_trans_handle *trans,
 		btrfs_abort_transaction(trans, ret);
 		goto fail;
 	}
-	ret = btrfs_uuid_tree_add(trans, fs_info->uuid_root, new_uuid.b,
+	ret = btrfs_uuid_tree_add(trans, fs_info, new_uuid.b,
 				  BTRFS_UUID_KEY_SUBVOL, objectid);
 	if (ret) {
 		btrfs_abort_transaction(trans, ret);
 		goto fail;
 	}
 	if (!btrfs_is_empty_uuid(new_root_item->received_uuid)) {
-		ret = btrfs_uuid_tree_add(trans, fs_info->uuid_root,
+		ret = btrfs_uuid_tree_add(trans, fs_info,
 					  new_root_item->received_uuid,
 					  BTRFS_UUID_KEY_RECEIVED_SUBVOL,
 					  objectid);
@@ -2142,7 +2141,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 	 */
 	mutex_lock(&root->fs_info->tree_log_mutex);
 
-	ret = commit_fs_roots(trans, root);
+	ret = commit_fs_roots(trans, root->fs_info);
 	if (ret) {
 		mutex_unlock(&root->fs_info->tree_log_mutex);
 		mutex_unlock(&root->fs_info->reloc_mutex);
